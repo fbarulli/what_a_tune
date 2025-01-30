@@ -30,12 +30,18 @@ network_training:
   fgm:
     default_epsilon: 0.5
     emb_name: embeddings.word_embeddings.weight
+  gradient_control:
+    clip_norm_type: 2
+    clip_value: 1.0
+    detect_anomaly: true
+    log_interval: 100
+    scale_coefficient: 0.5
   optimizer:
-    anneal_strategy: cos
-    div_factor: 25
-    eps: 1e-8
-    final_div_factor: 10000.0
-    pct_start: 0.3
+    anneal_strategy: linear
+    div_factor: 10
+    eps: 1.0e-08
+    final_div_factor: 1000.0
+    pct_start: 0.1
   reduce_lr_on_plateau:
     factor: 0.1
     mode: min
@@ -43,6 +49,31 @@ network_training:
     verbose: true
 num_labels: 5
 rdrop_alpha: 0.3
+regularization:
+  attention_dropout: 0.1
+  classifier_dropout: 0.2
+  ema_decay: 0.999
+  focal_alpha: 2.0
+  focal_gamma: 2.0
+  hidden_dropout: 0.1
+  label_smoothing: 0.1
+  layer_decay:
+    decay_rate: 0.95
+    enabled: true
+    exclude_layers:
+    - bias
+    - LayerNorm.weight
+  mixup_alpha: 0.2
+  rdrop_alpha: 0.3
+  swa:
+    anneal_epochs: 3
+    anneal_strategy: cos
+    enabled: true
+    epochs: 5
+    lr: 1e-5
+  use_ema: true
+  use_focal: true
+  weight_decay: 0.01
 scheduler:
   grace_period: 3
   max_t: 20
@@ -56,8 +87,8 @@ search_space:
     min: 1.0e-09
     type: loguniform
   adv_epsilon:
-    max: 0.6
-    min: 0.2
+    max: 0.3
+    min: 0.1
     type: uniform
   adv_training:
     type: categorical
@@ -81,23 +112,21 @@ search_space:
     values:
     - 1
     - 2
-    - 4
-    - 8
   gradient_checkpointing:
     type: categorical
     values:
     - true
     - false
   hidden_dropout_prob:
-    max: 0.7
+    max: 0.5
     min: 0.1
     type: uniform
   hidden_layer_dropout:
-    max: 0.7
+    max: 0.5
     min: 0.3
     type: uniform
   initial_learning_rate:
-    max: 0.0001
+    max: 5.0e-05
     min: 1.0e-06
     type: loguniform
   intermediate_size_factor:
@@ -116,16 +145,16 @@ search_space:
     min: 1.0e-12
     type: loguniform
   learning_rate:
-    max: 0.0001
+    max: 5.0e-05
     min: 1.0e-06
     type: loguniform
   max_grad_norm:
-    max: 2.0
+    max: 1.0
     min: 0.5
     type: uniform
   max_lr:
-    max: 5.0e-05
-    min: 1.0e-05
+    max: 2.0e-05
+    min: 5.0e-06
     type: loguniform
   num_attention_heads:
     type: categorical
@@ -159,12 +188,13 @@ search_space:
 seed: 42
 total_steps: 1000
 training:
+  adv_training: true
   cpus_per_trial: 1
   early_stopping_patience: 5
   fp16_training: true
   gpus_per_trial: 0.25
   gradient_accumulation_steps: 1
-  initial_learning_rate: 1.57e-05
+  initial_learning_rate: 1e-5
   max_concurrent_trials: 4
   num_samples: 1000
 use_tune: true

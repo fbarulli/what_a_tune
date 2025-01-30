@@ -11,142 +11,18 @@ import os
 from torch.optim.lr_scheduler import OneCycleLR, ReduceLROnPlateau
 from torch.optim import AdamW
 import copy
+from gpu_tracker import GPUTracker  # Add this import
+import numpy as np
+from model_components import Mixout, SpectralNorm, PoolingHead, FGM, RDropLoss, EMA, FocalLoss
+from typing import Dict, List, Optional
+from torch.nn.utils import clip_grad_norm_
+
+
+
+
 
 logger = logging.getLogger(__name__)
 
-class Mixout(nn.Module):
-    def __init__(self, p=0.5, hidden_size=None, scale_to_dropout=True):
-        super().__init__()
-        self.p = p
-        self.hidden_size = hidden_size
-        self.scale_to_dropout = scale_to_dropout
-        self.mask = None
-
-    def forward(self, x, scale=1.0):
-        if not self.training or self.p == 0:
-            return x
-
-        if self.mask is None or self.mask.shape != x.shape:
-            self.mask = torch.ones_like(x).bernoulli_(1 - self.p)
-            if self.scale_to_dropout:
-                self.mask = self.mask / (1-self.p)
-
-        return x * self.mask * scale
-
-class SpectralNorm(nn.Module):
-    def __init__(self, module, num_iters=1):
-        super().__init__()
-        self.module = module
-        self.num_iters = num_iters
-        self._u = None
-        self._v = None
-
-    def _l2normalize(self, x):
-        return x / (torch.norm(x) + 1e-12)
-
-    def _spectral_norm(self):
-        w = self.module.weight.view(self.module.weight.size(0), -1)
-
-        if self._v is None:
-            self._v = self._l2normalize(torch.randn(w.size(1)).to(w.device))
-        if self._u is None:
-            self._u = self._l2normalize(torch.randn(w.size(0)).to(w.device))
-
-        for _ in range(self.num_iters):
-            self._v = self._l2normalize(torch.mv(w.t(), self._u))
-            self._u = self._l2normalize(torch.mv(w, self._v))
-
-        sigma = torch.dot(torch.mv(w, self._v), self._u)
-        return sigma.detach()
-
-    def forward(self, *args, **kwargs):
-        sigma = self._spectral_norm()
-        self._weight = self.module.weight / sigma
-        original_weight = self.module.weight
-        self.module.weight = nn.Parameter(self._weight)
-        output = self.module(*args, **kwargs)
-        self.module.weight = original_weight
-        return output
-
-class PoolingHead(nn.Module):
-    def __init__(self, hidden_size, num_classes, dropout_prob, config):
-        super().__init__()
-        reduction_factor = config['model_architecture']['pooling_head']['dense_reduction_factor']
-        enable_spectral_norm = config['model_architecture']['pooling_head']['enable_spectral_norm']
-        
-        # Define layers with configurable reduction
-        dense1_size = hidden_size * 3
-        dense2_size = hidden_size // reduction_factor
-        
-        # Create layers with optional spectral norm
-        dense1 = nn.Linear(dense1_size, hidden_size)
-        self.dense1 = SpectralNorm(dense1) if enable_spectral_norm else dense1
-        
-        dense2 = nn.Linear(hidden_size, dense2_size)
-        self.dense2 = SpectralNorm(dense2) if enable_spectral_norm else dense2
-        
-        self.layer_norm1 = nn.LayerNorm(hidden_size)
-        self.layer_norm2 = nn.LayerNorm(dense2_size)
-        self.dropout = nn.Dropout(dropout_prob)
-        self.classifier = nn.Linear(dense2_size, num_classes)
-
-    def forward(self, hidden_states, attention_mask):
-        cls_token = hidden_states[:, 0]
-        
-        # Mean pooling
-        mean_pool = (
-            torch.sum(hidden_states * attention_mask.unsqueeze(-1), dim=1)
-            / attention_mask.sum(dim=1, keepdim=True)
-        )
-
-        # Max pooling
-        max_pool, _ = torch.max(hidden_states * attention_mask.unsqueeze(-1), dim=1)
-
-        # Concatenate and pass through MLP
-        pooled = torch.cat([cls_token, mean_pool, max_pool], dim=1)
-        x = self.layer_norm1(F.gelu(self.dense1(pooled)))
-        x = self.layer_norm2(F.gelu(self.dense2(x)))
-        x = self.dropout(x)
-        return self.classifier(x)
-
-class FGM():
-    def __init__(self, model, config):
-        self.model = model
-        self.backup = {}
-        self.default_epsilon = config['network_training']['fgm']['default_epsilon']
-        self.emb_name = config['network_training']['fgm']['emb_name']
-
-    def attack(self, epsilon=None):
-        epsilon = epsilon or self.default_epsilon
-        for name, param in self.model.named_parameters():
-            if param.requires_grad and self.emb_name in name:
-                self.backup[name] = param.data.clone()
-                norm = torch.norm(param.grad)
-                if norm != 0 and not torch.isnan(norm):
-                    r_at = epsilon * param.grad / norm
-                    param.data.add_(r_at)
-
-    def restore(self):
-        for name, param in self.model.named_parameters():
-            if param.requires_grad and self.emb_name in name:
-                assert name in self.backup
-                param.data = self.backup[name]
-        self.backup = {}
-
-class RDropLoss(nn.Module):
-    def __init__(self, alpha):
-        super().__init__()
-        self.alpha = alpha
-
-    def forward(self, logits1, logits2, labels):
-        ce_loss = F.cross_entropy(logits1, labels)
-        kl_loss = self._kl_loss(logits1, logits2)
-        return ce_loss + self.alpha * kl_loss
-
-    def _kl_loss(self, p, q):
-        p_log_prob = F.log_softmax(p, dim=-1)
-        q_prob = F.softmax(q, dim=-1)
-        return F.kl_div(p_log_prob, q_prob, reduction='batchmean')
 
 class OptimizedModel(pl.LightningModule):
     def __init__(self, config):
@@ -156,21 +32,33 @@ class OptimizedModel(pl.LightningModule):
         self.model_cache_dir = os.path.join(self.project_root, "results", "model_cache")
         os.makedirs(self.model_cache_dir, exist_ok=True)
         self.validation_outputs = []
-
+        
         logger.info(f"Initializing model with config: {config}")
 
+        # Initialize base model with specific config
         self.model = AutoModel.from_pretrained(
             config['model_name'],
-            cache_dir=self.model_cache_dir
+            cache_dir=self.model_cache_dir,
+            hidden_dropout_prob=config['hidden_dropout_prob'],
+            attention_probs_dropout_prob=config['regularization']['attention_dropout'],
         )
-
-        # Unfreeze specified number of top layers
+        
+        # Initialize weights of unfrozen layers with proper dimension checking
         unfrozen_layers = config['model_architecture']['unfrozen_layers']
         for param in self.model.parameters():
             param.requires_grad = False
+        
         for layer in self.model.encoder.layer[-unfrozen_layers:]:
-            for param in layer.parameters():
+            for name, param in layer.named_parameters():
                 param.requires_grad = True
+                if hasattr(param, 'data'):
+                    # Only apply Xavier initialization to weight matrices
+                    if len(param.shape) >= 2:
+                        if 'weight' in name:
+                            torch.nn.init.xavier_normal_(param.data)
+                    elif len(param.shape) == 1:
+                        # For biases and 1D parameters
+                        torch.nn.init.zeros_(param.data)
 
         self.pooling_head = PoolingHead(
             self.model.config.hidden_size,
@@ -179,89 +67,262 @@ class OptimizedModel(pl.LightningModule):
             config=config
         )
 
-        if config.get('gradient_checkpointing', False):
+        # Initialize pooling head weights with proper dimension checking
+        for name, param in self.pooling_head.named_parameters():
+            if hasattr(param, 'data'):
+                if len(param.shape) >= 2 and 'weight' in name:
+                    torch.nn.init.xavier_normal_(param.data)
+                elif len(param.shape) == 1:
+                    torch.nn.init.zeros_(param.data)
+
+        if config['search_space']['gradient_checkpointing']['values'][0]:
             self.model.gradient_checkpointing_enable()
 
         self.save_hyperparameters(config)
-        self.fgm = FGM(self.model, config)
+        
+        # Initialize training components
         self.rdrop_loss = RDropLoss(alpha=config['rdrop_alpha'])
         self.automatic_optimization = False
+        
+        # Initialize regularization with careful scaling
+        self.focal_loss = FocalLoss(
+            alpha=config['regularization']['focal_alpha'],
+            gamma=config['regularization']['focal_gamma']
+        )
+        
+        # Enable or disable regularizations based on config
+        self.use_focal = config['regularization']['use_focal']
+        self.mixup_alpha = config['regularization']['mixup_alpha']
+        
+        # Initialize EMA last to ensure proper weight initialization
+        if config['regularization']['use_ema']:
+            self.ema = EMA(self.model, decay=config['regularization']['ema_decay'])
+            self.ema.register()
+        
+        # Track gradient norms for monitoring
+        self.grad_norm_queue = []
+        
+        # Initialize loss scaling for numerical stability
+        self.loss_scaler = torch.cuda.amp.GradScaler(enabled=config['training']['fp16_training'])
+
+
+    def _prepare_inputs(self, inputs):
+        """Prepare inputs with proper type casting and device placement."""
+        prepared_inputs = {}
+        for k, v in inputs.items():
+            if not hasattr(v, 'to'):
+                prepared_inputs[k] = v
+                continue
+                
+            if k == 'input_ids':
+                prepared_inputs[k] = v.to(self.device, dtype=torch.long, non_blocking=True)
+            elif k == 'attention_mask':
+                prepared_inputs[k] = v.to(self.device, dtype=torch.long, non_blocking=True)
+            else:
+                prepared_inputs[k] = v.to(self.device, non_blocking=True)
+        return prepared_inputs
+
+
+    def mixup_data(self, x, y, alpha):
+        """Performs mixup on the input and label."""
+        if alpha > 0:
+            lam = np.random.beta(alpha, alpha)
+        else:
+            lam = 1
+
+        batch_size = x.size()[0]
+        index = torch.randperm(batch_size).cuda()
+
+        mixed_x = lam * x + (1 - lam) * x[index, :]
+        y_a, y_b = y, y[index]
+        return mixed_x, y_a, y_b, lam
 
     def forward(self, **inputs):
-        model_inputs = {k: v for k, v in inputs.items()
-                       if k not in ['labels'] and hasattr(v, 'to')}
+        model_inputs = self._prepare_inputs({
+            k: v for k, v in inputs.items() if k not in ['labels']
+        })
 
         outputs = self.model(**model_inputs, output_hidden_states=True)
         last_hidden_states = outputs.last_hidden_state
-        logits = self.pooling_head(last_hidden_states, inputs['attention_mask'])
+        
+        # Apply layer norm before pooling for better stability
+        last_hidden_states = F.layer_norm(
+            last_hidden_states, 
+            [self.model.config.hidden_size]
+        )
+        
+        logits = self.pooling_head(last_hidden_states, model_inputs['attention_mask'])
         return logits
 
-    def training_step(self, batch, batch_idx):
+    def _compute_loss(self, logits1, logits2, labels, batch_idx):
+        """Compute loss with proper scaling and regularization."""
+        # Basic cross entropy loss
+        ce_loss = F.cross_entropy(logits1, labels)
+        
+        # RDrop loss with temperature scaling for better gradients
+        rdrop_loss = self.rdrop_loss(
+            logits1 / 1.5,  # Temperature scaling
+            logits2 / 1.5,  # Temperature scaling
+            labels
+        )
+        
+        # Combine losses with careful scaling
+        if self.use_focal:
+            focal_loss = self.focal_loss(logits1, labels)
+            loss = ce_loss + 0.5 * rdrop_loss + 0.1 * focal_loss
+        else:
+            loss = ce_loss + 0.5 * rdrop_loss
+            
+        return loss / self.config['training']['gradient_accumulation_steps']
+
+    def training_step(self, batch: Dict[str, torch.Tensor], batch_idx: int) -> torch.Tensor:
+        """Execute a single training step with gradient stabilization.
+        
+        Args:
+            batch: Dictionary containing the batch data
+            batch_idx: Index of the current batch
+            
+        Returns:
+            torch.Tensor: The computed loss value
+        """
+        gpu_tracker = GPUTracker()
+        gpu_tracker.track_step("start_of_step", model=self)
+        
         optimizer = self.optimizers()
         scheduler = self.lr_schedulers()
+        
+        batch = self._prepare_inputs(batch)
         labels = batch.pop('labels')
 
-        fp16_enabled = self.config['training'].get('fp16_training', True)
+        # Reset gradients at the start
+        optimizer.zero_grad()
 
-        with torch.amp.autocast('cuda', enabled=fp16_enabled):
-            # Forward pass
-            logits1 = self(**batch)
-            batch['labels'] = labels
+        # Forward pass with gradient scaling and stability improvements
+        with torch.cuda.amp.autocast(enabled=self.config['training']['fp16_training']):
+            if self.mixup_alpha > 0:
+                mixed_x, y_a, y_b, lam = self.mixup_data(batch['input_ids'], labels, self.mixup_alpha)
+                mixed_attn = batch['attention_mask']
+                logits1 = self(**{'input_ids': mixed_x, 'attention_mask': mixed_attn})
+            else:
+                logits1 = self(**batch)
+                y_a, y_b = labels, None
 
-            # R-drop forward pass
-            batch2 = copy.deepcopy(batch)
-            logits2 = self(**{k: v for k, v in batch2.items() if k != 'labels'})
+            # R-drop forward pass with stability improvements
+            with torch.no_grad():
+                logits2 = self(**batch)
 
-            # R-Drop loss
-            loss = self.rdrop_loss(logits1, logits2, labels)
-            self.log('train_loss', loss, prog_bar=True, sync_dist=True)
-            self.manual_backward(loss / self.config['training']['gradient_accumulation_steps'], 
-                               retain_graph=True)
+            # Label smoothing for better stability
+            smoothing = 0.1
+            num_classes = logits1.size(-1)
+            labels_one_hot = F.one_hot(labels, num_classes).float()
+            labels_smooth = (1.0 - smoothing) * labels_one_hot + smoothing / num_classes
+            
+            # Compute stabilized loss
+            loss = F.cross_entropy(logits1, labels_smooth)
+            
+            if self.rdrop_loss is not None:
+                rdrop_loss = self.rdrop_loss(
+                    F.log_softmax(logits1 / 2.0, dim=-1),
+                    F.log_softmax(logits2 / 2.0, dim=-1),
+                    labels
+                ) * 0.5
+                loss = loss + rdrop_loss
 
+        gpu_tracker.track_step("after_loss", local_vars={'loss': loss})
+
+        # Scale loss and compute gradients
+        scaled_loss = self.loss_scaler.scale(loss)
+        self.manual_backward(scaled_loss)
+
+        gpu_tracker.track_step("after_backward", model=self)
+
+        # Gradient norm tracking
+        all_params = [p for p in self.parameters() if p.requires_grad]
+        
+        # Update on accumulation step
         if (batch_idx + 1) % self.config['training']['gradient_accumulation_steps'] == 0:
-            # Adversarial training
-            if self.config['training'].get('adv_training', True):
-                self.fgm.attack(epsilon=self.config['search_space'].get('adv_epsilon', {}).get('max', 0.5))
-                with torch.amp.autocast('cuda', enabled=fp16_enabled):
-                    adv_logits = self(**{k: v for k, v in batch.items() if k != 'labels'})
-                    adv_loss = self.rdrop_loss(adv_logits, logits2, labels)
-                self.manual_backward(adv_loss / self.config['training']['gradient_accumulation_steps'])
-                self.fgm.restore()
-
-            # Gradient clipping
-            if self.config['training'].get('max_grad_norm', None):
-                torch.nn.utils.clip_grad_norm_(
-                    self.parameters(),
-                    self.config['training']['max_grad_norm']
+            # Track gradient norm before potential clipping
+            with torch.no_grad():
+                total_norm = torch.norm(
+                    torch.stack([torch.norm(p.grad.detach(), 2) for p in all_params if p.grad is not None])
                 )
-
-            optimizer.step()
-            scheduler.step()
+                
+                # Track gradient statistics
+                if len(self.grad_norm_queue) >= 100:
+                    self.grad_norm_queue.pop(0)
+                self.grad_norm_queue.append(total_norm.item())
+            
+            # Handle gradient clipping inside scaler context
+            clip_value = float(self.config['network_training']['gradient_control']['clip_value'])
+            
+            # Step with gradient scaler
+            self.loss_scaler.step(optimizer)
+            self.loss_scaler.update()
+            
+            # Step scheduler after optimizer
+            if scheduler is not None:
+                scheduler.step()
+            
+            # Reset gradients after stepping
             optimizer.zero_grad()
+
+        # Compute metrics for logging
+        if self.grad_norm_queue:
+            avg_grad_norm = sum(self.grad_norm_queue) / len(self.grad_norm_queue)
+            self.log('grad_norm', avg_grad_norm, prog_bar=True)
+            self.log('grad_loss_ratio', avg_grad_norm / loss.item(), prog_bar=True)
+        
+        # Log base metrics
+        self.log('train_loss', loss.item(), prog_bar=True, sync_dist=True)
+        self.log('learning_rate', optimizer.param_groups[0]['lr'], prog_bar=True)
 
         return loss
 
+
+
+    def on_train_epoch_end(self):
+        if self.use_ema:
+            self.ema.apply_shadow()
+        
+        # Existing epoch end code...
+        
+        if self.use_ema:
+            self.ema.restore()
+
     def validation_step(self, batch, batch_idx):
+        if hasattr(self, 'ema') and self.config['regularization']['use_ema']:
+            self.ema.apply_shadow()
+            
         try:
-            with torch.amp.autocast('cuda', enabled=self.config['training'].get('fp16_training', True)):
+            batch = self._prepare_inputs(batch)
+            
+            with torch.cuda.amp.autocast(enabled=self.config['training']['fp16_training']):
                 labels = batch.pop('labels')
-                inputs = {k: v for k, v in batch.items() if k not in ['labels']}
-                logits = self(**inputs)
+                logits = self(**batch)
                 loss = F.cross_entropy(logits, labels)
                 preds = torch.argmax(logits, dim=-1)
                 acc = torch.tensor(accuracy_score(labels.cpu(), preds.cpu()))
 
             self.log('val_loss', loss, prog_bar=True, sync_dist=True)
             self.log('val_acc', acc, prog_bar=True, sync_dist=True)
+            
             self.validation_outputs.append({
                 'val_loss': loss.detach(),
-                'val_acc': acc
+                'val_acc': acc,
+                'logits_mean': logits.mean().item(),
+                'logits_std': logits.std().item()
             })
-            return {'val_loss': loss, 'val_acc': acc}
+            
         except Exception as e:
             logger.error(f"Error during validation step: {str(e)}")
             logger.error(traceback.format_exc())
             return None
+        finally:
+            if hasattr(self, 'ema') and self.config['regularization']['use_ema']:
+                self.ema.restore()
+        
+        return {'val_loss': loss, 'val_acc': acc}
+
 
     def on_validation_epoch_start(self):
         self.validation_outputs = []
@@ -286,61 +347,52 @@ class OptimizedModel(pl.LightningModule):
             self.log('avg_val_acc', torch.tensor(0.0), prog_bar=True, sync_dist=True)
 
     def configure_optimizers(self):
-        try:
-            no_decay = ['bias', 'LayerNorm.weight']
-            optimizer_grouped_parameters = [
-                {
-                    'params': [p for n, p in self.named_parameters()
-                              if not any(nd in n for nd in no_decay)],
-                    'weight_decay': self.config['weight_decay']
-                },
-                {
-                    'params': [p for n, p in self.named_parameters()
-                              if any(nd in n for nd in no_decay)],
-                    'weight_decay': 0.0
-                }
-            ]
-
-            optimizer = AdamW(
-                optimizer_grouped_parameters,
-                lr=self.config['training']['initial_learning_rate'],
-                eps=self.config['search_space']['adam_epsilon']['max'],
-                weight_decay=self.config['weight_decay']
-            )
-
-            data_module = self.trainer.datamodule
-            steps_per_epoch = len(data_module.train_dataloader()) // self.config['training']['gradient_accumulation_steps']
-            total_steps = steps_per_epoch * self.trainer.max_epochs
-
-            scheduler = OneCycleLR(
-                optimizer,
-                max_lr=float(self.config['search_space']['max_lr']['max']),
-                total_steps=total_steps,
-                pct_start=float(self.config['network_training']['optimizer']['pct_start']),
-                div_factor=float(self.config['network_training']['optimizer']['div_factor']),
-                final_div_factor=float(self.config['network_training']['optimizer']['final_div_factor']),
-                anneal_strategy=self.config['network_training']['optimizer']['anneal_strategy']
-            )
-
-            reduce_lr_on_plateau = ReduceLROnPlateau(
-                optimizer,
-                mode=self.config['network_training']['reduce_lr_on_plateau']['mode'],
-                factor=float(self.config['network_training']['reduce_lr_on_plateau']['factor']),
-                patience=int(self.config['network_training']['reduce_lr_on_plateau']['patience']),
-                verbose=bool(self.config['network_training']['reduce_lr_on_plateau']['verbose'])
-            )
-
-            lr_scheduler = {
-                'scheduler': scheduler,
-                'interval': 'step'
+        """Configure optimizers with proper learning rate scheduling."""
+        # Separate parameters for different learning rates
+        no_decay = ['bias', 'LayerNorm.weight']
+        optimizer_grouped_parameters = [
+            {
+                'params': [p for n, p in self.named_parameters() 
+                        if not any(nd in n for nd in no_decay)],
+                'weight_decay': float(self.config['weight_decay']),
+                'lr': float(self.config['training']['initial_learning_rate'])
+            },
+            {
+                'params': [p for n, p in self.named_parameters() 
+                        if any(nd in n for nd in no_decay)],
+                'weight_decay': 0.0,
+                'lr': float(self.config['training']['initial_learning_rate'])
             }
+        ]
 
-            lr_scheduler['reduce_on_plateau'] = reduce_lr_on_plateau
-            return {
-                'optimizer': optimizer,
-                'lr_scheduler': lr_scheduler
+        # Initialize optimizer with normalized learning rate
+        optimizer = torch.optim.AdamW(
+            optimizer_grouped_parameters,
+            lr=float(self.config['training']['initial_learning_rate']),
+            eps=float(self.config['network_training']['optimizer']['eps']),
+            betas=(0.9, 0.999)  # Standard Adam betas
+        )
+
+        # Calculate training steps
+        total_steps = len(self.trainer.datamodule.train_dataloader()) * self.trainer.max_epochs
+        warmup_steps = total_steps // 10  # 10% warmup
+
+        # Create scheduler with warmup
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=float(self.config['search_space']['max_lr']['max']),
+            total_steps=total_steps,
+            pct_start=warmup_steps / total_steps,  # Warm up for first 10%
+            div_factor=10.0,  # Initial lr = max_lr / 10
+            final_div_factor=1e4,  # Min lr = initial_lr / 1e4
+            anneal_strategy='linear'
+        )
+
+        return {
+            "optimizer": optimizer,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "step",
+                "frequency": 1
             }
-        except Exception as e:
-            logger.error(f"Error configuring optimizers: {str(e)}")
-            logger.error(traceback.format_exc())
-            return None
+        }
